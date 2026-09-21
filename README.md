@@ -1,7 +1,7 @@
 # RobotArmESP32
 This is our Version of the Easy Robot Arm by mobiobi [Makerworld Link](https://makerworld.com/en/models/13180-easy-robot-arm-sg90-servos-now-steppers-too-update#profileId-74638)
 <p align="center">
-  <img width="270" height="480" src="[https://picsum.photos/460/300](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/tbrender480.png)">
+  <img width="270" height="480" src="https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/tbrender480.png">
 </p>
 
 https://www.thingiverse.com/thing:3642542
