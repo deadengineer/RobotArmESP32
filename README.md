@@ -9,10 +9,11 @@ https://www.thingiverse.com/thing:3642542
 ## 28byj-48 Planetary Gears
 ![Planet Gears](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/tbrender_004_480.png)
 
-##
+## Breadboard Wiring
+
 ![BreadboardDiagram](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/RobotArm_Steckplatine480.png)
-Breadboard Wiring
-##
-Soldered Control with Touch Screen 
+
+## Soldered Control with Touch Screen 
+
 ![BreadboardDiagram](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/RobotSolderedControl_Steckplatine480.png)
 
