@@ -7,4 +7,6 @@ https://www.thingiverse.com/thing:3642542
 28byj-48 Planetary Gears
 ![Planet Gears](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/tbrender_004_480.png)
 
-![BreadboardDiagram](https://github.com/deadengineer/RobotArmESP32/blob/main/WiringDiagram/RobotArm_Steckplatine.png)
+![BreadboardDiagram](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/RobotArm_Steckplatine480.png)
+![BreadboardDiagram](https://github.com/deadengineer/RobotArmESP32/blob/main/ResizedImages/RobotSolderedControl_Steckplatine480.png)
+
