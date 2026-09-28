@@ -18,7 +18,24 @@ XPT2046_Touchscreen ts(CS_PIN);
 #define TS_MAXX 3800
 #define TS_MINY 200
 #define TS_MAXY 3800
+struct ImageSpan {
+  uint16_t x;
+  uint16_t y;
+  uint16_t length;
+  uint32_t pixelOffset;
+};
 
+struct CompressedBMP {
+  uint16_t width = 0;
+  uint16_t height = 0;
+
+  ImageSpan *spans = nullptr;
+  uint16_t *pixels = nullptr;
+
+  uint32_t spanCount = 0;
+  uint32_t pixelCount = 0;
+};
+CompressedBMP arm1 = {};
 //Second SPI
 int sck = 14;
 int miso = 27;
@@ -27,7 +44,7 @@ int cs = 13;
 SPIClass SPI2(HSPI);
 TFT_eSPI tft = TFT_eSPI();
 HardwareSerial SerialSecond(2);
-uint8_t  bmpBuffer[320 * 3 + 4];
+uint8_t bmpBuffer[320 * 3 + 4];
 uint16_t lineBuffer[320];
 const char *images[] = {
   "/Arm1.bmp",
@@ -38,6 +55,9 @@ const char *images[] = {
   "/Arm6.bmp",
   "/calibrationPose.bmp"
 };
+uint8_t backgroundR = 0;
+uint8_t backgroundG = 0;
+uint8_t backgroundB = 0;
 void setup() {
   Serial.begin(115200);
   SPI.begin(18, 19, 23);
@@ -45,7 +65,7 @@ void setup() {
   // Landscape
   tft.init();
   tft.setRotation(3);
-
+  tft.setSwapBytes(false);
   Serial.print("Breite: ");
   Serial.println(tft.width());
 
@@ -61,7 +81,6 @@ void setup() {
     SERIAL_8N1,
     RX2,
     TX2);
-  tft.setSwapBytes(true);
   if (!SD.begin(SDCS_PIN, SPI2, 1000000)) {
     Serial.println("SD mount failed");
     return;
@@ -73,6 +92,27 @@ void setup() {
     Serial.println(entry.name());
     entry = root.openNextFile();
   }
+  Serial.println(
+  "Loading Arm1 into RAM..."
+);
+
+if (
+  loadBMPCompressed(
+    "/Arm1.bmp",
+    arm1
+  )
+) {
+
+  Serial.println(
+    "Arm1 loaded"
+  );
+}
+else {
+
+  Serial.println(
+    "Arm1 load failed"
+  );
+}
   drawBMP("/Arm1.bmp", 0, 0);
 }
 
@@ -183,25 +223,23 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
     return;
   }
 
-  read32(bmpFile);                 // file size
-  read32(bmpFile);                 // reserved
+  read32(bmpFile);  // file size
+  read32(bmpFile);  // reserved
 
   uint32_t imageOffset = read32(bmpFile);
 
-  read32(bmpFile);                 // DIB header size
+  read32(bmpFile);  // DIB header size
 
-  int32_t bmpWidth  = (int32_t)read32(bmpFile);
+  int32_t bmpWidth = (int32_t)read32(bmpFile);
   int32_t bmpHeight = (int32_t)read32(bmpFile);
 
   uint16_t planes = read16(bmpFile);
-  uint16_t depth  = read16(bmpFile);
+  uint16_t depth = read16(bmpFile);
 
   uint32_t compression = read32(bmpFile);
 
   // Only 24-bit uncompressed BMP
-  if (planes != 1 ||
-      depth != 24 ||
-      compression != 0) {
+  if (planes != 1 || depth != 24 || compression != 0) {
 
     Serial.println("Only 24-bit uncompressed BMP supported");
     bmpFile.close();
@@ -247,8 +285,7 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
     x,
     y,
     drawWidth,
-    drawHeight
-  );
+    drawHeight);
 
   for (int row = 0; row < drawHeight; row++) {
 
@@ -256,13 +293,10 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
 
     if (flip) {
       position =
-        imageOffset +
-        (bmpHeight - 1 - row) * rowSize;
-    }
-    else {
+        imageOffset + (bmpHeight - 1 - row) * rowSize;
+    } else {
       position =
-        imageOffset +
-        row * rowSize;
+        imageOffset + row * rowSize;
     }
 
     bmpFile.seek(position);
@@ -276,8 +310,7 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
     int bytesRead =
       bmpFile.read(
         bmpBuffer,
-        bytesNeeded
-      );
+        bytesNeeded);
 
     if (bytesRead != bytesNeeded) {
       Serial.println("BMP read error");
@@ -298,9 +331,7 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
 
       // Faster than calling color565()
       lineBuffer[col] =
-        ((r & 0xF8) << 8) |
-        ((g & 0xFC) << 3) |
-        (b >> 3);
+        ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     }
 
     // ------------------------------
@@ -309,8 +340,7 @@ void drawBMP(const char *filename, int16_t x, int16_t y) {
 
     tft.pushPixels(
       lineBuffer,
-      drawWidth
-    );
+      drawWidth);
   }
 
   tft.endWrite();
@@ -332,4 +362,372 @@ uint32_t read32(File &f) {
   ((uint8_t *)&result)[2] = f.read();
   ((uint8_t *)&result)[3] = f.read();
   return result;
+}
+
+
+bool isTransparent(uint8_t r, uint8_t g, uint8_t b) {
+  const int tolerance = 15;
+
+  return abs((int)r - backgroundR) <= tolerance &&
+         abs((int)g - backgroundG) <= tolerance &&
+         abs((int)b - backgroundB) <= tolerance;
+}
+
+bool loadBMPCompressed(
+  const char *filename,
+  CompressedBMP &img) {
+
+  File bmpFile = SD.open(filename, FILE_READ);
+
+  if (!bmpFile) {
+    Serial.print("Could not open: ");
+    Serial.println(filename);
+    return false;
+  }
+
+  // ----------------------------------
+  // BMP header
+  // ----------------------------------
+
+  if (read16(bmpFile) != 0x4D42) {
+    Serial.println("Not a BMP");
+    bmpFile.close();
+    return false;
+  }
+
+  read32(bmpFile);  // file size
+  read32(bmpFile);  // reserved
+
+  uint32_t imageOffset = read32(bmpFile);
+
+  read32(bmpFile);  // DIB header
+
+  int32_t bmpWidth =
+    (int32_t)read32(bmpFile);
+
+  int32_t bmpHeight =
+    (int32_t)read32(bmpFile);
+
+  uint16_t planes = read16(bmpFile);
+  uint16_t depth = read16(bmpFile);
+
+  uint32_t compression = read32(bmpFile);
+
+  if (
+    planes != 1 || depth != 24 || compression != 0) {
+
+    Serial.println(
+      "BMP must be 24-bit uncompressed");
+
+    bmpFile.close();
+    return false;
+  }
+
+  bool flip = true;
+
+  if (bmpHeight < 0) {
+    bmpHeight = -bmpHeight;
+    flip = false;
+  }
+
+  img.width = bmpWidth;
+  img.height = bmpHeight;
+
+  uint32_t rowSize =
+    (bmpWidth * 3 + 3) & ~3;
+
+  // Temporary row buffer
+  uint8_t *rowBuffer =
+    (uint8_t *)malloc(rowSize);
+
+  if (!rowBuffer) {
+    Serial.println(
+      "Could not allocate row buffer");
+
+    bmpFile.close();
+    return false;
+  }
+
+  // ==================================================
+  // PASS 1
+  // Count visible pixels and spans
+  // ==================================================
+
+  uint32_t totalPixels = 0;
+  uint32_t totalSpans = 0;
+
+  for (
+    int row = 0;
+    row < bmpHeight;
+    row++) {
+
+    uint32_t position;
+
+    if (flip) {
+      position =
+        imageOffset + (bmpHeight - 1 - row) * rowSize;
+    } else {
+      position =
+        imageOffset + row * rowSize;
+    }
+
+    bmpFile.seek(position);
+
+    if (
+      bmpFile.read(
+        rowBuffer,
+        rowSize)
+      != rowSize) {
+
+      Serial.println(
+        "BMP read error");
+
+      free(rowBuffer);
+      bmpFile.close();
+
+      return false;
+    }
+
+    bool insideSpan = false;
+
+    for (
+      int x = 0;
+      x < bmpWidth;
+      x++) {
+
+      uint8_t *p =
+        &rowBuffer[x * 3];
+
+      uint8_t b = p[0];
+      uint8_t g = p[1];
+      uint8_t r = p[2];
+
+      bool transparent =
+        isTransparent(r, g, b);
+
+      if (!transparent) {
+
+        totalPixels++;
+
+        if (!insideSpan) {
+          totalSpans++;
+          insideSpan = true;
+        }
+      } else {
+        insideSpan = false;
+      }
+    }
+  }
+
+  Serial.print("Visible pixels: ");
+  Serial.println(totalPixels);
+
+  Serial.print("Spans: ");
+  Serial.println(totalSpans);
+
+  // ==================================================
+  // Allocate exact amount of memory
+  // ==================================================
+
+  img.pixels =
+    (uint16_t *)imageMalloc(
+      totalPixels * sizeof(uint16_t));
+
+  img.spans =
+    (ImageSpan *)imageMalloc(
+      totalSpans * sizeof(ImageSpan));
+
+  if (
+    img.pixels == nullptr || img.spans == nullptr) {
+
+    Serial.println(
+      "Image RAM allocation failed");
+
+    if (img.pixels)
+      free(img.pixels);
+
+    if (img.spans)
+      free(img.spans);
+
+    img.pixels = nullptr;
+    img.spans = nullptr;
+
+    free(rowBuffer);
+    bmpFile.close();
+
+    return false;
+  }
+
+  img.pixelCount = totalPixels;
+  img.spanCount = totalSpans;
+
+  // ==================================================
+  // PASS 2
+  // Build compressed representation
+  // ==================================================
+
+  uint32_t pixelIndex = 0;
+  uint32_t spanIndex = 0;
+
+  for (
+    int row = 0;
+    row < bmpHeight;
+    row++) {
+
+    uint32_t position;
+
+    if (flip) {
+      position =
+        imageOffset + (bmpHeight - 1 - row) * rowSize;
+    } else {
+      position =
+        imageOffset + row * rowSize;
+    }
+
+    bmpFile.seek(position);
+
+    bmpFile.read(
+      rowBuffer,
+      rowSize);
+
+    bool insideSpan = false;
+
+    uint16_t spanStart = 0;
+    uint16_t spanLength = 0;
+    uint32_t spanPixelStart = 0;
+
+    for (
+      int x = 0;
+      x < bmpWidth;
+      x++) {
+
+      uint8_t *p =
+        &rowBuffer[x * 3];
+
+      uint8_t b = p[0];
+      uint8_t g = p[1];
+      uint8_t r = p[2];
+
+      bool transparent =
+        isTransparent(r, g, b);
+
+      if (!transparent) {
+
+        // Start new span
+        if (!insideSpan) {
+
+          insideSpan = true;
+
+          spanStart = x;
+          spanLength = 0;
+
+          spanPixelStart =
+            pixelIndex;
+        }
+
+        // Convert directly to RGB565
+        img.pixels[pixelIndex++] =
+          ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+
+        spanLength++;
+      }
+
+      // End of current span
+      if (
+        insideSpan && (transparent || x == bmpWidth - 1)) {
+
+        ImageSpan &span =
+          img.spans[spanIndex++];
+
+        span.x = spanStart;
+        span.y = row;
+        span.length = spanLength;
+
+        span.pixelOffset =
+          spanPixelStart;
+
+        insideSpan = false;
+      }
+    }
+  }
+
+  free(rowBuffer);
+  bmpFile.close();
+
+  // ----------------------------------
+  // Stats
+  // ----------------------------------
+
+  uint32_t pixelRAM =
+    img.pixelCount * sizeof(uint16_t);
+
+  uint32_t spanRAM =
+    img.spanCount * sizeof(ImageSpan);
+
+  Serial.println();
+  Serial.print("Compressed RAM: ");
+  Serial.print(
+    pixelRAM + spanRAM);
+  Serial.println(" bytes");
+
+  Serial.print("Pixel data: ");
+  Serial.print(pixelRAM);
+  Serial.println(" bytes");
+
+  Serial.print("Span data: ");
+  Serial.print(spanRAM);
+  Serial.println(" bytes");
+
+  return true;
+}
+
+void drawCompressedBMP(
+  const CompressedBMP &img,
+  int16_t xOffset,
+  int16_t yOffset) {
+
+  tft.startWrite();
+
+  for (
+    uint32_t i = 0;
+    i < img.spanCount;
+    i++) {
+
+    const ImageSpan &span =
+      img.spans[i];
+
+    int16_t x =
+      xOffset + span.x;
+
+    int16_t y =
+      yOffset + span.y;
+
+    // Skip spans outside display
+    if (
+      y < 0 || y >= tft.height()) {
+      continue;
+    }
+
+    if (
+      x >= tft.width() || x + span.length <= 0) {
+      continue;
+    }
+
+    tft.pushImage(
+      x,
+      y,
+      span.length,
+      1,
+      &img.pixels[span.pixelOffset]);
+  }
+
+  tft.endWrite();
+}
+void *imageMalloc(size_t bytes) {
+
+  if (psramFound()) {
+    return ps_malloc(bytes);
+  }
+
+  return malloc(bytes);
 }
