@@ -1,733 +1,335 @@
 #include <SPI.h>
-#include <XPT2046_Touchscreen.h>
-// Animates white pixels to simulate flying through a star field
-#include "FS.h"
-#include "SD.h"
-#include <SPI.h>
+#include <SD.h>
 #include <TFT_eSPI.h>
-#include <SPI.h>
+#include <XPT2046_Touchscreen.h>
 #include <HardwareSerial.h>
+
 #define RX2 16
 #define TX2 17
-#define CS_PIN 21
-XPT2046_Touchscreen ts(CS_PIN);
-#define SDCS_PIN 13
-// Temporary calibration values.
-// Fine-tune these after measuring all four corners.
+HardwareSerial SerialSecond(2);
+
+#define TOUCH_CS 21
+XPT2046_Touchscreen ts(TOUCH_CS);
+
 #define TS_MINX 200
 #define TS_MAXX 3800
 #define TS_MINY 200
 #define TS_MAXY 3800
-struct ImageSpan {
-  uint16_t x;
-  uint16_t y;
-  uint16_t length;
-  uint32_t pixelOffset;
-};
 
-struct CompressedBMP {
-  uint16_t width = 0;
-  uint16_t height = 0;
-
-  ImageSpan *spans = nullptr;
-  uint16_t *pixels = nullptr;
-
-  uint32_t spanCount = 0;
-  uint32_t pixelCount = 0;
-};
-CompressedBMP arm1 = {};
-//Second SPI
-int sck = 14;
-int miso = 27;
-int mosi = 26;
-int cs = 13;
+#define SD_SCK 14
+#define SD_MISO 27
+#define SD_MOSI 26
+#define SD_CS 13
 SPIClass SPI2(HSPI);
+
 TFT_eSPI tft = TFT_eSPI();
-HardwareSerial SerialSecond(2);
-uint8_t bmpBuffer[320 * 3 + 4];
-uint16_t lineBuffer[320];
+
+#define IMAGE_WIDTH 320
+#define IMAGE_HEIGHT 240
+#define BUFFER_LINES 16
+uint16_t imageBuffer[IMAGE_WIDTH * BUFFER_LINES];
+
 const char *images[] = {
-  "/Arm1.bmp",
-  "/Arm2.bmp",
-  "/Arm3.bmp",
-  "/Arm4.bmp",
-  "/Arm5.bmp",
-  "/Arm6.bmp",
-  "/calibrationPose.bmp"
+  "/Arm1.rgb565",
+  "/Arm2.rgb565",
+  "/Arm3.rgb565",
+  "/Arm4.rgb565",
+  "/Arm5.rgb565",
+  "/Arm6.rgb565",
+  "/calibrationPose.rgb565"
 };
-uint8_t backgroundR = 0;
-uint8_t backgroundG = 0;
-uint8_t backgroundB = 0;
+
+constexpr int IMAGE_COUNT = sizeof(images) / sizeof(images[0]);
+
+int currentImage = -1;
+bool touchHandled = false;
+
+bool SHOW_DEBUG_UI = true;
+bool SHOW_TOUCH_DOT = true;
+
+bool drawRGB565(const char *filename, int16_t x, int16_t y, uint16_t width, uint16_t height);
+void showImage(int imageNumber);
+bool insideButton(int touchX, int touchY, int x, int y, int w, int h);
+
+bool calib = false;
+
 void setup() {
   Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("Starting...");
+
   SPI.begin(18, 19, 23);
-  SPI2.begin(sck, miso, mosi, cs);
-  // Landscape
+
   tft.init();
   tft.setRotation(3);
-  tft.setSwapBytes(false);
-  Serial.print("Breite: ");
-  Serial.println(tft.width());
+  tft.setSwapBytes(true);
+  tft.fillScreen(TFT_BLACK);
 
-  Serial.print("Hoehe: ");
+  Serial.print("Width: ");
+  Serial.println(tft.width());
+  Serial.print("Height: ");
   Serial.println(tft.height());
 
-  tft.fillScreen(TFT_BLACK);
   ts.begin();
   ts.setRotation(1);
 
-  SerialSecond.begin(
-    9600,  // baud rate
-    SERIAL_8N1,
-    RX2,
-    TX2);
-  if (!SD.begin(SDCS_PIN, SPI2, 1000000)) {
+  SerialSecond.begin(9600, SERIAL_8N1, RX2, TX2);
+  SerialSecond.setTimeout(50);
+
+  SPI2.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  Serial.println("Mounting SD...");
+  if (!SD.begin(SD_CS, SPI2, 10000000)) {
     Serial.println("SD mount failed");
     return;
   }
 
+  Serial.println("SD mounted");
+
   File root = SD.open("/");
-  File entry = root.openNextFile();
-  while (entry) {
-    Serial.println(entry.name());
-    entry = root.openNextFile();
+  if (root) {
+    File entry = root.openNextFile();
+    while (entry) {
+      Serial.print(entry.name());
+      if (!entry.isDirectory()) {
+        Serial.print("  ");
+        Serial.print(entry.size());
+        Serial.println(" bytes");
+      } else {
+        Serial.println();
+      }
+      entry.close();
+      entry = root.openNextFile();
+    }
+    root.close();
   }
-  Serial.println(
-  "Loading Arm1 into RAM..."
-);
 
-if (
-  loadBMPCompressed(
-    "/Arm1.bmp",
-    arm1
-  )
-) {
-
-  Serial.println(
-    "Arm1 loaded"
-  );
-}
-else {
-
-  Serial.println(
-    "Arm1 load failed"
-  );
-}
-  drawBMP("/Arm1.bmp", 0, 0);
+  showImage(0);
+  tft.fillRect(10, 200, 80, 30, TFT_WHITE);
+  tft.setTextColor(TFT_BLACK);
+  tft.drawString("Calibration", 20, 210);
+  tft.setTextColor(TFT_GREEN);
+  tft.drawString("Debug", 230, 20);
 }
 
 void loop() {
-  if (!ts.touched())
-    return;
+  bool touching = ts.touched();
 
-  TS_Point p = ts.getPoint();
+  if (touching && !touchHandled) {
+    touchHandled = true;
 
-  Serial.print("RAW X=");
-  Serial.print(p.x);
-  Serial.print(" Y=");
-  Serial.print(p.y);
-  Serial.print(" Z=");
-  Serial.println(p.z);
+    TS_Point p = ts.getPoint();
 
-  // Reject only clearly invalid data
-  if (p.x < 20 || p.x > 4200 || p.y < 20 || p.y > 4200) {
-    return;
+    if (p.x >= 20 && p.x <= 4200 && p.y >= 20 && p.y <= 4200) {
+      int x = map(p.x, TS_MINX, TS_MAXX, 0, tft.width() - 1);
+      int y = map(p.y, TS_MINY, TS_MAXY, 0, tft.height() - 1);
+
+      x = constrain(x, 0, tft.width() - 1);
+      y = constrain(y, 0, tft.height() - 1);
+
+      Serial.print("Touch: ");
+      Serial.print(x);
+      Serial.print(", ");
+      Serial.println(y);
+
+      if (SHOW_TOUCH_DOT) {
+        tft.fillCircle(x, y, 4, TFT_RED);
+      }
+      if (insideButton(x, y, 220, 10, 40, 30) && SHOW_DEBUG_UI == true) {
+        SHOW_DEBUG_UI = false;
+        SHOW_TOUCH_DOT = false;
+        showImage(currentImage);
+        tft.setTextColor(TFT_BLACK);
+        tft.drawString("Debug", 230, 20);
+      } else if (insideButton(x, y, 220, 10, 40, 30) && SHOW_DEBUG_UI == false) {
+        SHOW_DEBUG_UI = true;
+        SHOW_TOUCH_DOT = true;
+        showImage(currentImage);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString("Debug", 230, 20);
+      }
+      if (!calib) {
+        if (insideButton(x, y, 120, 140, 60, 50)) {
+          Serial.println("Button 1");
+          showImage(0);
+        } else if (insideButton(x, y, 90, 80, 60, 50)) {
+          Serial.println("Button 2");
+          showImage(1);
+        } else if (insideButton(x, y, 115, 190, 80, 40)) {
+          Serial.println("Button 3");
+          showImage(2);
+        } else if (insideButton(x, y, 140, 40, 30, 40)) {
+          Serial.println("Button 4");
+          showImage(3);
+        } else if (insideButton(x, y, 170, 30, 30, 60)) {
+          Serial.println("Button 5");
+          showImage(4);
+        }
+
+        else if (insideButton(x, y, 200, 30, 80, 60)) {
+          Serial.println("Button 6");
+          showImage(5);
+
+        } else if (insideButton(x, y, 10, 200, 80, 30)) {
+          Serial.println("Calibration");
+          showImage(6);
+          calib = true;
+          tft.fillRect(220, 200, 80, 30, TFT_WHITE);
+          tft.setTextColor(TFT_BLACK);
+          tft.drawString("Done", 230, 210);
+        }
+      } else if (insideButton(x, y, 220, 200, 80, 30)) {
+        Serial.println("Return");
+        showImage(0);
+        calib = false;
+        tft.fillRect(10, 200, 80, 30, TFT_WHITE);
+        tft.setTextColor(TFT_BLACK);
+        tft.drawString("Calibration", 20, 210);
+      }
+      if (SHOW_DEBUG_UI) { void drawGrid(); }
+      if (SHOW_TOUCH_DOT) { void drawDebug(); }
+    }
   }
 
-  int x = map(
-    p.x,
-    TS_MINX,
-    TS_MAXX,
-    0,
-    tft.width() - 1);
-
-  int y = map(
-    p.y,
-    TS_MINY,
-    TS_MAXY,
-    0,
-    tft.height() - 1);
-
-  x = constrain(x, 0, tft.width() - 1);
-  y = constrain(y, 0, tft.height() - 1);
-
-  Serial.print("Touch at: ");
-  Serial.print(x);
-  Serial.print(", ");
-  Serial.println(y);
-
-  tft.fillCircle(x, y, 4, TFT_RED);
+  if (!touching) {
+    touchHandled = false;
+  }
 
   if (SerialSecond.available()) {
-
     int nummer = SerialSecond.parseInt();
 
-    // Restliche Zeichen wie \n / \r entfernen
     while (SerialSecond.available()) {
       SerialSecond.read();
     }
 
-    switch (nummer) {
-
-      case 1:
-        drawBMP("/Arm1.bmp", 0, 0);
-        Serial.println("Bild 1");
-        break;
-
-      case 2:
-        drawBMP("/Arm2.bmp", 0, 0);
-        Serial.println("Bild 2");
-        break;
-
-      case 3:
-        drawBMP("/Arm3.bmp", 0, 0);
-        Serial.println("Bild 3");
-        break;
-
-      case 4:
-        drawBMP("/Arm4.bmp", 0, 0);
-        Serial.println("Bild 4");
-        break;
-
-      case 5:
-        drawBMP("/Arm5.bmp", 0, 0);
-        Serial.println("Bild 5");
-        break;
-
-      case 6:
-        drawBMP("/Arm6.bmp", 0, 0);
-        Serial.println("Bild 6");
-        break;
-
-      default:
-        Serial.println("Ungueltige Nummer. Bitte 1 bis 6 senden.");
-        break;
+    if (nummer >= 1 && nummer <= 6) {
+      Serial.print("Displaying image ");
+      Serial.println(nummer);
+      showImage(nummer - 1);
+    } else {
+      Serial.println("Invalid number. Send 1-6.");
     }
   }
 }
 
-void drawBMP(const char *filename, int16_t x, int16_t y) {
+bool drawRGB565(const char *filename, int16_t x, int16_t y, uint16_t width, uint16_t height) {
+  uint32_t startTime = millis();
 
-  File bmpFile = SD.open(filename, FILE_READ);
+  Serial.print("Opening ");
+  Serial.println(filename);
 
-  if (!bmpFile) {
-    Serial.print("Could not open: ");
+  File file = SD.open(filename, FILE_READ);
+  if (!file) {
+    Serial.print("Could not open ");
     Serial.println(filename);
-    return;
+    return false;
   }
 
-  // BMP signature
-  if (read16(bmpFile) != 0x4D42) {
-    Serial.println("Not a BMP");
-    bmpFile.close();
-    return;
+  const uint32_t expectedSize = (uint32_t)width * height * sizeof(uint16_t);
+  const uint32_t actualSize = file.size();
+
+  if (actualSize != expectedSize) {
+    Serial.print("Wrong file size for ");
+    Serial.println(filename);
+    Serial.print("Actual: ");
+    Serial.println(actualSize);
+    Serial.print("Expected: ");
+    Serial.println(expectedSize);
+    file.close();
+    return false;
   }
 
-  read32(bmpFile);  // file size
-  read32(bmpFile);  // reserved
+  uint16_t currentY = 0;
+  bool success = true;
 
-  uint32_t imageOffset = read32(bmpFile);
+  while (currentY < height) {
+    uint16_t lines = min((uint16_t)BUFFER_LINES, (uint16_t)(height - currentY));
+    size_t pixelCount = (size_t)width * lines;
+    size_t bytesNeeded = pixelCount * sizeof(uint16_t);
 
-  read32(bmpFile);  // DIB header size
-
-  int32_t bmpWidth = (int32_t)read32(bmpFile);
-  int32_t bmpHeight = (int32_t)read32(bmpFile);
-
-  uint16_t planes = read16(bmpFile);
-  uint16_t depth = read16(bmpFile);
-
-  uint32_t compression = read32(bmpFile);
-
-  // Only 24-bit uncompressed BMP
-  if (planes != 1 || depth != 24 || compression != 0) {
-
-    Serial.println("Only 24-bit uncompressed BMP supported");
-    bmpFile.close();
-    return;
-  }
-
-  bool flip = true;
-
-  if (bmpHeight < 0) {
-    bmpHeight = -bmpHeight;
-    flip = false;
-  }
-
-  // Row is padded to multiple of 4 bytes
-  uint32_t rowSize =
-    (bmpWidth * 3 + 3) & ~3;
-
-  if (bmpWidth > 320) {
-    Serial.println("BMP too wide");
-    bmpFile.close();
-    return;
-  }
-
-  int drawWidth = bmpWidth;
-
-  if (x + drawWidth > tft.width())
-    drawWidth = tft.width() - x;
-
-  int drawHeight = bmpHeight;
-
-  if (y + drawHeight > tft.height())
-    drawHeight = tft.height() - y;
-
-  if (drawWidth <= 0 || drawHeight <= 0) {
-    bmpFile.close();
-    return;
-  }
-
-  // Start one long TFT transaction
-  tft.startWrite();
-
-  tft.setAddrWindow(
-    x,
-    y,
-    drawWidth,
-    drawHeight);
-
-  for (int row = 0; row < drawHeight; row++) {
-
-    uint32_t position;
-
-    if (flip) {
-      position =
-        imageOffset + (bmpHeight - 1 - row) * rowSize;
-    } else {
-      position =
-        imageOffset + row * rowSize;
-    }
-
-    bmpFile.seek(position);
-
-    // ------------------------------
-    // ONE SD READ FOR ENTIRE ROW
-    // ------------------------------
-
-    int bytesNeeded = drawWidth * 3;
-
-    int bytesRead =
-      bmpFile.read(
-        bmpBuffer,
-        bytesNeeded);
-
+    size_t bytesRead = file.read((uint8_t *)imageBuffer, bytesNeeded);
     if (bytesRead != bytesNeeded) {
-      Serial.println("BMP read error");
+      Serial.println("RGB565 read error");
+      success = false;
       break;
     }
 
-    // ------------------------------
-    // BGR888 -> RGB565
-    // ------------------------------
-
-    uint8_t *src = bmpBuffer;
-
-    for (int col = 0; col < drawWidth; col++) {
-
-      uint8_t b = *src++;
-      uint8_t g = *src++;
-      uint8_t r = *src++;
-
-      // Faster than calling color565()
-      lineBuffer[col] =
-        ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-    }
-
-    // ------------------------------
-    // Send whole row to TFT
-    // ------------------------------
-
-    tft.pushPixels(
-      lineBuffer,
-      drawWidth);
+    tft.pushImage(x, y + currentY, width, lines, imageBuffer);
+    currentY += lines;
   }
 
-  tft.endWrite();
+  file.close();
 
-  bmpFile.close();
+  uint32_t elapsed = millis() - startTime;
+  Serial.print("Image displayed in ");
+  Serial.print(elapsed);
+  Serial.println(" ms");
+
+  return success;
 }
 
-uint16_t read16(File &f) {
-  uint16_t result;
-  ((uint8_t *)&result)[0] = f.read();
-  ((uint8_t *)&result)[1] = f.read();
-  return result;
+void showImage(int imageNumber) {
+  if (imageNumber < 0 || imageNumber >= IMAGE_COUNT) {
+    Serial.println("Invalid image index");
+    return;
+  }
+
+  if (imageNumber == currentImage) {
+    return;
+  }
+
+  Serial.print("Changing image to ");
+  Serial.println(imageNumber);
+
+  if (drawRGB565(images[imageNumber], 0, 0, IMAGE_WIDTH, IMAGE_HEIGHT)) {
+    currentImage = imageNumber;
+
+    if (SHOW_DEBUG_UI) {
+      drawDebug();
+    }
+  }
 }
 
-uint32_t read32(File &f) {
-  uint32_t result;
-  ((uint8_t *)&result)[0] = f.read();
-  ((uint8_t *)&result)[1] = f.read();
-  ((uint8_t *)&result)[2] = f.read();
-  ((uint8_t *)&result)[3] = f.read();
-  return result;
+void drawDebug() {
+  drawGrid();
+
+  tft.drawRect(120, 140, 60, 50, TFT_RED);
+  tft.drawRect(90, 80, 60, 50, TFT_RED);
+  tft.drawRect(115, 190, 80, 40, TFT_RED);
+  tft.drawRect(140, 40, 30, 40, TFT_RED);
+  tft.drawRect(170, 30, 30, 60, TFT_RED);
+  tft.drawRect(200, 30, 80, 60, TFT_RED);
+  tft.drawRect(10, 200, 80, 30, TFT_RED);
 }
 
+void drawGrid() {
+  const int spacing = 10;
 
-bool isTransparent(uint8_t r, uint8_t g, uint8_t b) {
-  const int tolerance = 15;
+  for (int x = 0; x < tft.width(); x += spacing) {
+    tft.drawFastVLine(x, 0, tft.height(), TFT_DARKGREY);
+  }
 
-  return abs((int)r - backgroundR) <= tolerance &&
-         abs((int)g - backgroundG) <= tolerance &&
-         abs((int)b - backgroundB) <= tolerance;
+  for (int y = 0; y < tft.height(); y += spacing) {
+    tft.drawFastHLine(0, y, tft.width(), TFT_DARKGREY);
+  }
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(1);
+
+  for (int x = 0; x < tft.width(); x += 20) {
+    tft.setCursor(x + 2, 2);
+    tft.print(x);
+  }
+
+  for (int y = 0; y < tft.height(); y += 20) {
+    tft.setCursor(2, y + 2);
+    tft.print(y);
+  }
 }
 
-bool loadBMPCompressed(
-  const char *filename,
-  CompressedBMP &img) {
-
-  File bmpFile = SD.open(filename, FILE_READ);
-
-  if (!bmpFile) {
-    Serial.print("Could not open: ");
-    Serial.println(filename);
-    return false;
-  }
-
-  // ----------------------------------
-  // BMP header
-  // ----------------------------------
-
-  if (read16(bmpFile) != 0x4D42) {
-    Serial.println("Not a BMP");
-    bmpFile.close();
-    return false;
-  }
-
-  read32(bmpFile);  // file size
-  read32(bmpFile);  // reserved
-
-  uint32_t imageOffset = read32(bmpFile);
-
-  read32(bmpFile);  // DIB header
-
-  int32_t bmpWidth =
-    (int32_t)read32(bmpFile);
-
-  int32_t bmpHeight =
-    (int32_t)read32(bmpFile);
-
-  uint16_t planes = read16(bmpFile);
-  uint16_t depth = read16(bmpFile);
-
-  uint32_t compression = read32(bmpFile);
-
-  if (
-    planes != 1 || depth != 24 || compression != 0) {
-
-    Serial.println(
-      "BMP must be 24-bit uncompressed");
-
-    bmpFile.close();
-    return false;
-  }
-
-  bool flip = true;
-
-  if (bmpHeight < 0) {
-    bmpHeight = -bmpHeight;
-    flip = false;
-  }
-
-  img.width = bmpWidth;
-  img.height = bmpHeight;
-
-  uint32_t rowSize =
-    (bmpWidth * 3 + 3) & ~3;
-
-  // Temporary row buffer
-  uint8_t *rowBuffer =
-    (uint8_t *)malloc(rowSize);
-
-  if (!rowBuffer) {
-    Serial.println(
-      "Could not allocate row buffer");
-
-    bmpFile.close();
-    return false;
-  }
-
-  // ==================================================
-  // PASS 1
-  // Count visible pixels and spans
-  // ==================================================
-
-  uint32_t totalPixels = 0;
-  uint32_t totalSpans = 0;
-
-  for (
-    int row = 0;
-    row < bmpHeight;
-    row++) {
-
-    uint32_t position;
-
-    if (flip) {
-      position =
-        imageOffset + (bmpHeight - 1 - row) * rowSize;
-    } else {
-      position =
-        imageOffset + row * rowSize;
-    }
-
-    bmpFile.seek(position);
-
-    if (
-      bmpFile.read(
-        rowBuffer,
-        rowSize)
-      != rowSize) {
-
-      Serial.println(
-        "BMP read error");
-
-      free(rowBuffer);
-      bmpFile.close();
-
-      return false;
-    }
-
-    bool insideSpan = false;
-
-    for (
-      int x = 0;
-      x < bmpWidth;
-      x++) {
-
-      uint8_t *p =
-        &rowBuffer[x * 3];
-
-      uint8_t b = p[0];
-      uint8_t g = p[1];
-      uint8_t r = p[2];
-
-      bool transparent =
-        isTransparent(r, g, b);
-
-      if (!transparent) {
-
-        totalPixels++;
-
-        if (!insideSpan) {
-          totalSpans++;
-          insideSpan = true;
-        }
-      } else {
-        insideSpan = false;
-      }
-    }
-  }
-
-  Serial.print("Visible pixels: ");
-  Serial.println(totalPixels);
-
-  Serial.print("Spans: ");
-  Serial.println(totalSpans);
-
-  // ==================================================
-  // Allocate exact amount of memory
-  // ==================================================
-
-  img.pixels =
-    (uint16_t *)imageMalloc(
-      totalPixels * sizeof(uint16_t));
-
-  img.spans =
-    (ImageSpan *)imageMalloc(
-      totalSpans * sizeof(ImageSpan));
-
-  if (
-    img.pixels == nullptr || img.spans == nullptr) {
-
-    Serial.println(
-      "Image RAM allocation failed");
-
-    if (img.pixels)
-      free(img.pixels);
-
-    if (img.spans)
-      free(img.spans);
-
-    img.pixels = nullptr;
-    img.spans = nullptr;
-
-    free(rowBuffer);
-    bmpFile.close();
-
-    return false;
-  }
-
-  img.pixelCount = totalPixels;
-  img.spanCount = totalSpans;
-
-  // ==================================================
-  // PASS 2
-  // Build compressed representation
-  // ==================================================
-
-  uint32_t pixelIndex = 0;
-  uint32_t spanIndex = 0;
-
-  for (
-    int row = 0;
-    row < bmpHeight;
-    row++) {
-
-    uint32_t position;
-
-    if (flip) {
-      position =
-        imageOffset + (bmpHeight - 1 - row) * rowSize;
-    } else {
-      position =
-        imageOffset + row * rowSize;
-    }
-
-    bmpFile.seek(position);
-
-    bmpFile.read(
-      rowBuffer,
-      rowSize);
-
-    bool insideSpan = false;
-
-    uint16_t spanStart = 0;
-    uint16_t spanLength = 0;
-    uint32_t spanPixelStart = 0;
-
-    for (
-      int x = 0;
-      x < bmpWidth;
-      x++) {
-
-      uint8_t *p =
-        &rowBuffer[x * 3];
-
-      uint8_t b = p[0];
-      uint8_t g = p[1];
-      uint8_t r = p[2];
-
-      bool transparent =
-        isTransparent(r, g, b);
-
-      if (!transparent) {
-
-        // Start new span
-        if (!insideSpan) {
-
-          insideSpan = true;
-
-          spanStart = x;
-          spanLength = 0;
-
-          spanPixelStart =
-            pixelIndex;
-        }
-
-        // Convert directly to RGB565
-        img.pixels[pixelIndex++] =
-          ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-
-        spanLength++;
-      }
-
-      // End of current span
-      if (
-        insideSpan && (transparent || x == bmpWidth - 1)) {
-
-        ImageSpan &span =
-          img.spans[spanIndex++];
-
-        span.x = spanStart;
-        span.y = row;
-        span.length = spanLength;
-
-        span.pixelOffset =
-          spanPixelStart;
-
-        insideSpan = false;
-      }
-    }
-  }
-
-  free(rowBuffer);
-  bmpFile.close();
-
-  // ----------------------------------
-  // Stats
-  // ----------------------------------
-
-  uint32_t pixelRAM =
-    img.pixelCount * sizeof(uint16_t);
-
-  uint32_t spanRAM =
-    img.spanCount * sizeof(ImageSpan);
-
-  Serial.println();
-  Serial.print("Compressed RAM: ");
-  Serial.print(
-    pixelRAM + spanRAM);
-  Serial.println(" bytes");
-
-  Serial.print("Pixel data: ");
-  Serial.print(pixelRAM);
-  Serial.println(" bytes");
-
-  Serial.print("Span data: ");
-  Serial.print(spanRAM);
-  Serial.println(" bytes");
-
-  return true;
-}
-
-void drawCompressedBMP(
-  const CompressedBMP &img,
-  int16_t xOffset,
-  int16_t yOffset) {
-
-  tft.startWrite();
-
-  for (
-    uint32_t i = 0;
-    i < img.spanCount;
-    i++) {
-
-    const ImageSpan &span =
-      img.spans[i];
-
-    int16_t x =
-      xOffset + span.x;
-
-    int16_t y =
-      yOffset + span.y;
-
-    // Skip spans outside display
-    if (
-      y < 0 || y >= tft.height()) {
-      continue;
-    }
-
-    if (
-      x >= tft.width() || x + span.length <= 0) {
-      continue;
-    }
-
-    tft.pushImage(
-      x,
-      y,
-      span.length,
-      1,
-      &img.pixels[span.pixelOffset]);
-  }
-
-  tft.endWrite();
-}
-void *imageMalloc(size_t bytes) {
-
-  if (psramFound()) {
-    return ps_malloc(bytes);
-  }
-
-  return malloc(bytes);
+bool insideButton(int touchX, int touchY, int x, int y, int w, int h) {
+  return (
+    touchX > x && touchX < (x + w - 1) && touchY > y && touchY < (y + h - 1));
 }
